@@ -284,6 +284,51 @@ impl Store {
         Ok(n.map(|v| v + 1).unwrap_or(0))
     }
 
+    /// 某个工作单元下的全部步骤（按 index 升序）。
+    pub fn list_steps_by_unit(&self, unit_id: &str) -> Result<Vec<Step>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, unit_id, idx, kind, intent, effect_json, taint_json, risk, result_json, started_at, finished_at
+             FROM steps WHERE unit_id = ?1 ORDER BY idx ASC",
+        )?;
+        let rows = stmt.query_map(params![unit_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, u32>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, String>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, i64>(10)?,
+                r.get::<_, Option<i64>>(11)?,
+            ))
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, task_id, unit_id, index, kind, intent, effect, taint, risk, result, sa, fa) =
+                row?;
+            out.push(Step {
+                id,
+                task_id,
+                unit_id,
+                index,
+                kind: serde_json::from_str(&kind)?,
+                intent,
+                effect: effect.map(|e| serde_json::from_str(&e)).transpose()?,
+                taint: serde_json::from_str(&taint)?,
+                risk: serde_json::from_str(&risk)?,
+                result: serde_json::from_str(&result)?,
+                started_at: sa,
+                finished_at: fa,
+            });
+        }
+        Ok(out)
+    }
+
     // ------------------------------------------------------------ work units
 
     pub fn create_unit(&self, u: &WorkUnit) -> Result<()> {

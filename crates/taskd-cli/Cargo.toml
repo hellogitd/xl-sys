@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 taskd-core = { path = "../taskd-core" }
 taskd-store = { path = "../taskd-store" }
+taskd-undo = { path = "../taskd-undo" }

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/taskd-core",
     "crates/taskd-store",
+    "crates/taskd-undo",
     "crates/taskd-mcp",
     "crates/taskd-cli",
 ]

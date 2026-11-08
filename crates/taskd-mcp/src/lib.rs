@@ -8,6 +8,7 @@
 use serde_json::{json, Value};
 use taskd_core::*;
 use taskd_store::Store;
+use taskd_undo::{undo_to_unit, SnapshotStore};
 
 pub const SERVER_NAME: &str = "xl-taskd";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -17,11 +18,12 @@ const DEFAULT_PROTOCOL: &str = "2024-11-05";
 
 pub struct McpServer {
     store: Store,
+    snapshots: SnapshotStore,
 }
 
 impl McpServer {
-    pub fn new(store: Store) -> Self {
-        Self { store }
+    pub fn new(store: Store, snapshots: SnapshotStore) -> Self {
+        Self { store, snapshots }
     }
 
     /// 处理一行输入。返回 `None` 表示这是 notification（不需要回复）。
@@ -190,6 +192,18 @@ impl McpServer {
                     }
                 },
                 {
+                    "name": "task_undo",
+                    "description": "撤销到某个工作单元之前（撤销该单元及其之后的所有单元）。文件通过快照恢复；不可撤销的效果会列在 skipped 里。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": { "type": "string" },
+                            "to_unit": { "type": "string", "description": "目标工作单元编号；省略则撤销全部" }
+                        },
+                        "required": ["task_id"]
+                    }
+                },
+                {
                     "name": "delegation_request",
                     "description": "申请权限委托。创建的是未批准的请求，必须由人类批准后才生效（agent 不能自己批准）。",
                     "inputSchema": {
@@ -246,6 +260,7 @@ impl McpServer {
             "task_done" => self.tool_task_done(&args),
             "unit_begin" => self.tool_unit_begin(&args),
             "unit_end" => self.tool_unit_end(&args),
+            "task_undo" => self.tool_task_undo(&args),
             "delegation_request" => self.tool_delegation_request(&args),
             "delegation_list" => self.tool_delegation_list(&args),
             other => return Err((-32602, format!("未知工具：{other}"))),
@@ -296,22 +311,24 @@ impl McpServer {
                 .map_err(|e| e.to_string())?;
         }
 
-        // ---- 委托检查（S0.2）：带 target + action 的步骤必须先获得授权 ----
+        // ---- 委托检查（S0.2）+ 自动快照（S0.3）----
+        let target = args.get("target").and_then(|v| v.as_str());
+        let action_str = args.get("action").and_then(|v| v.as_str());
         let mut used_delegation: Option<String> = None;
-        if let (Some(target), Some(action_str)) = (
-            args.get("target").and_then(|v| v.as_str()),
-            args.get("action").and_then(|v| v.as_str()),
-        ) {
-            let action = parse_action(action_str)?;
+        let mut effect: Option<Effect> = None;
+        let mut snapshot_id: Option<String> = None;
+
+        if let (Some(t), Some(a)) = (target, action_str) {
+            let action = parse_action(a)?;
             let delegations = self
                 .store
                 .list_delegations(&task.id)
                 .map_err(|e| e.to_string())?;
 
-            match check_delegations(&delegations, target, action, now_ms()) {
+            match check_delegations(&delegations, t, action, now_ms()) {
                 CheckOutcome::Allowed { delegation } => {
                     self.store
-                        .log_access(&task.id, Some(&delegation), target, action, true)
+                        .log_access(&task.id, Some(&delegation), t, action, true)
                         .map_err(|e| e.to_string())?;
                     self.store
                         .touch_delegation(&delegation)
@@ -320,7 +337,7 @@ impl McpServer {
                 }
                 CheckOutcome::NeedsPermission => {
                     self.store
-                        .log_access(&task.id, None, target, action, false)
+                        .log_access(&task.id, None, t, action, false)
                         .map_err(|e| e.to_string())?;
                     // P-4：越界 = 暂停 + 请求，不是拒绝 + 继续
                     if task.state == TaskState::Running {
@@ -330,12 +347,32 @@ impl McpServer {
                     return Err(serde_json::to_string(&json!({
                         "error": "NEEDS_PERMISSION",
                         "task_id": task.id,
-                        "target": target,
-                        "action": action_str,
+                        "target": t,
+                        "action": a,
                         "task_state": "paused",
                         "hint": "调用 delegation_request 申请委托，等人类批准后重试本步骤"
                     }))
                     .unwrap_or_default());
+                }
+            }
+
+            // 写/删之前先留底，否则这一步不可撤销
+            if matches!(action, Action::Write | Action::Delete) && looks_like_path(t) {
+                let path = std::path::PathBuf::from(t);
+                match self.snapshots.capture(&path) {
+                    Ok(meta) => {
+                        snapshot_id = Some(meta.id.clone());
+                        effect = Some(Effect::SnapshotRef {
+                            root: path.display().to_string(),
+                            snapshot: meta.id,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "无法对 {} 做快照：{e}\n该操作将不可撤销，已拒绝执行。",
+                            path.display()
+                        ));
+                    }
                 }
             }
         }
@@ -372,6 +409,9 @@ impl McpServer {
         if let Some(unit) = args.get("unit_id").and_then(|v| v.as_str()) {
             step = step.with_unit(unit);
         }
+        if let Some(e) = effect {
+            step = step.with_effect(e);
+        }
         step.finish(StepResult::Ok { payload: None });
         self.store
             .append_step(&step)
@@ -382,7 +422,33 @@ impl McpServer {
             "index": idx,
             "intent": step.intent,
             "risk": risk_label(step.risk),
-            "delegation": used_delegation
+            "delegation": used_delegation,
+            "snapshot": snapshot_id
+        }))
+    }
+
+    // ------------------------------------------------------------ 撤销
+
+    fn tool_task_undo(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "task_id")?;
+        let to_unit = args.get("to_unit").and_then(|v| v.as_str());
+
+        let task = self
+            .store
+            .get_task(&task_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("任务不存在：{task_id}"))?;
+
+        let report = undo_to_unit(&self.store, &self.snapshots, &task.id, to_unit)
+            .map_err(|e| format!("撤销失败：{e}"))?;
+
+        Ok(json!({
+            "task_id": task.id,
+            "units_undone": report.units_undone,
+            "steps_reverted": report.steps_reverted,
+            "files_restored": report.files_restored,
+            "skipped": report.skipped,
+            "elapsed_ms": report.elapsed_ms
         }))
     }
 
@@ -601,6 +667,20 @@ fn parse_action(s: &str) -> Result<Action, String> {
     }
 }
 
+/// 粗略判断 target 是否是文件系统路径（而不是 URL / 设备名 / 逻辑名）。
+fn looks_like_path(s: &str) -> bool {
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return false;
+    }
+    // Unix 绝对/相对路径
+    if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") {
+        return true;
+    }
+    // Windows 盘符：C:\ 或 C:/
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 fn success_response(id: Value, result: Value) -> String {
     json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
 }
@@ -659,7 +739,13 @@ mod tests {
     use super::*;
 
     fn server() -> McpServer {
-        McpServer::new(Store::open_in_memory().unwrap())
+        let dir = std::env::temp_dir().join(format!(
+            "taskd-mcp-test-{}-{}",
+            std::process::id(),
+            taskd_core::new_id("t")
+        ));
+        let snaps = SnapshotStore::new(dir).expect("snapshot store");
+        McpServer::new(Store::open_in_memory().unwrap(), snaps)
     }
 
     fn call(s: &mut McpServer, line: &str) -> Value {

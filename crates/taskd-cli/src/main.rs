@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use taskd_core::*;
 use taskd_store::Store;
+use taskd_undo::{undo_to_unit, SnapshotStore};
 
 const DEFAULT_DB: &str = "taskd.db";
 
@@ -33,6 +34,7 @@ fn main() -> ExitCode {
         "request" => cmd_request(&args[1..]),
         "approve" => cmd_approve(&args[1..]),
         "delegations" => cmd_delegations(&args[1..]),
+        "undo" => cmd_undo(&args[1..]),
         "help" | "--help" | "-h" => {
             help();
             Ok(())
@@ -65,6 +67,7 @@ fn help() {
   xl-taskd request <任务编号> <范围> <动作...>  申请委托（需人类批准）
   xl-taskd approve <委托编号>              批准委托（人类动作）
   xl-taskd delegations <任务编号>           查看委托状态
+  xl-taskd undo <任务编号> [工作单元编号]    撤销到某个工作单元之前（省略=全部）
 
 环境变量：
   XLTASKD_DB    数据库路径，默认 ./taskd.db
@@ -146,8 +149,11 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // ---- 委托检查 ----
+    // ---- 委托检查 + 自动快照 ----
     let mut used: Option<String> = None;
+    let mut effect: Option<Effect> = None;
+    let mut snapshot_id: Option<String> = None;
+
     if let (Some(t), Some(a)) = (&target, &action_str) {
         let action = parse_action(a)?;
         let delegations = store.list_delegations(&task.id).map_err(|e| e.to_string())?;
@@ -175,6 +181,29 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
                 ));
             }
         }
+
+        // 写/删之前先留底，否则这一步不可撤销
+        if matches!(action, Action::Write | Action::Delete) && looks_like_path(t) {
+            let snap_dir = std::env::var("XLTASKD_SNAPSHOTS")
+                .unwrap_or_else(|_| "taskd-snapshots".to_string());
+            let snaps = SnapshotStore::new(&snap_dir).map_err(|e| e.to_string())?;
+            let path = std::path::PathBuf::from(t);
+            match snaps.capture(&path) {
+                Ok(meta) => {
+                    snapshot_id = Some(meta.id.clone());
+                    effect = Some(Effect::SnapshotRef {
+                        root: path.display().to_string(),
+                        snapshot: meta.id,
+                    });
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "无法对 {} 做快照：{e}\n该操作将不可撤销，已拒绝执行。",
+                        path.display()
+                    ))
+                }
+            }
+        }
     }
 
     // 暂停中的任务在通过检查后恢复
@@ -188,6 +217,9 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
 
     let idx = store.next_step_index(&task.id).map_err(|e| e.to_string())?;
     let mut step = Step::new(&task.id, idx, StepKind::ToolCall, &intent);
+    if let Some(e) = effect {
+        step = step.with_effect(e);
+    }
     step.finish(StepResult::Ok { payload: None });
     store.append_step(&step).map_err(|e| e.to_string())?;
 
@@ -197,7 +229,22 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
     if let Some(d) = used {
         println!("  授权  {}（已计入审计）", d);
     }
+    if let Some(s) = snapshot_id {
+        println!("  快照  {s}（可撤销）");
+    }
     Ok(())
+}
+
+/// 粗略判断 target 是否是文件系统路径。
+fn looks_like_path(s: &str) -> bool {
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return false;
+    }
+    if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") {
+        return true;
+    }
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 fn parse_action(s: &str) -> Result<Action, String> {
@@ -416,6 +463,40 @@ fn cmd_delegations(args: &[String]) -> Result<(), String> {
             d.scope,
             d.actions
         );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 撤销
+
+fn cmd_undo(args: &[String]) -> Result<(), String> {
+    let task_id = args
+        .first()
+        .ok_or("用法：xl-taskd undo <任务编号> [工作单元编号]")?;
+    let to_unit = args.get(1).map(|s| s.as_str());
+
+    let store = open_store()?;
+    let task = store
+        .get_task(task_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("任务不存在：{task_id}"))?;
+
+    let snap_dir = std::env::var("XLTASKD_SNAPSHOTS")
+        .unwrap_or_else(|_| "taskd-snapshots".to_string());
+    let snaps = SnapshotStore::new(&snap_dir).map_err(|e| e.to_string())?;
+
+    let report =
+        undo_to_unit(&store, &snaps, &task.id, to_unit).map_err(|e| format!("撤销失败：{e}"))?;
+
+    println!("撤销完成（用时 {} ms）", report.elapsed_ms);
+    println!("  撤销单元  {} 个", report.units_undone);
+    println!("  回退步骤  {} 步", report.steps_reverted);
+    println!("  恢复文件  {} 个", report.files_restored);
+    if !report.skipped.is_empty() {
+        println!("  无法自动撤销：");
+        for s in &report.skipped {
+            println!("    · {s}");
+        }
     }
     Ok(())
 }

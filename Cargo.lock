@@ -343,6 +343,7 @@ version = "0.1.0"
 dependencies = [
  "taskd-core",
  "taskd-store",
+ "taskd-undo",
 ]
 
 [[package]]
@@ -363,6 +364,7 @@ dependencies = [
  "serde_json",
  "taskd-core",
  "taskd-store",
+ "taskd-undo",
 ]
 
 [[package]]
@@ -373,6 +375,17 @@ dependencies = [
  "serde",
  "serde_json",
  "taskd-core",
+ "thiserror",
+]
+
+[[package]]
+name = "taskd-undo"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "taskd-core",
+ "taskd-store",
  "thiserror",
 ]
 
