@@ -356,6 +356,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "taskd-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "taskd-core",
+ "taskd-store",
+]
+
+[[package]]
 name = "taskd-store"
 version = "0.1.0"
 dependencies = [

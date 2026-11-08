@@ -12,10 +12,13 @@
 | 模块 | 内容 | 状态 |
 |---|---|---|
 | `taskd-core` | 任务 / 工作单元 / 步骤 / 委托 / 溯源的数据模型 | ✅ 19 个单元测试 |
-| `taskd-store` | SQLite 持久化（步骤仅追加，任务可恢复） | ✅ |
+| `taskd-store` | SQLite 持久化（步骤仅追加，任务可恢复） | ✅ 6 个单元测试 |
+| `taskd-mcp` | MCP server（stdio + JSON-RPC），7 个工具 | ✅ 8 个单元测试 |
 | `xl-taskd` CLI | 创建任务、记录步骤、工作单元、查看历史 | ✅ |
 
-未实现：委托检查（S0.2）、撤销引擎（S0.3）、溯源传播（S0.4）、MCP server。
+未实现：委托检查（S0.2）、撤销引擎（S0.3）、溯源传播（S0.4）。
+
+MCP 接入方式见 [docs/MCP-SETUP.md](docs/MCP-SETUP.md)。
 
 ### 快速试用
 
