@@ -406,6 +406,20 @@ impl TaintSet {
     pub fn untrusted(&self) -> impl Iterator<Item = &TaintSource> {
         self.sources.iter().filter(|s| s.is_untrusted())
     }
+
+    /// 稳定指纹：用于判断「用户确认之后，来源集合有没有变过」。
+    ///
+    /// 排序后拼接，所以与添加顺序无关。
+    pub fn fingerprint(&self) -> String {
+        let mut parts: Vec<String> = self.sources.iter().map(|s| s.describe()).collect();
+        parts.sort();
+        parts.join(" | ")
+    }
+
+    /// 人类可读的来源清单（只列不可信来源）。
+    pub fn untrusted_descriptions(&self) -> Vec<String> {
+        self.untrusted().map(|s| s.describe()).collect()
+    }
 }
 
 // ---------------------------------------------------------------- 委托

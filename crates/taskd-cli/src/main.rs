@@ -35,6 +35,8 @@ fn main() -> ExitCode {
         "approve" => cmd_approve(&args[1..]),
         "delegations" => cmd_delegations(&args[1..]),
         "undo" => cmd_undo(&args[1..]),
+        "taint" => cmd_taint(&args[1..]),
+        "acknowledge" => cmd_acknowledge(&args[1..]),
         "help" | "--help" | "-h" => {
             help();
             Ok(())
@@ -59,6 +61,7 @@ fn help() {
   xl-taskd begin <目标>                    创建一个任务
   xl-taskd step <任务编号> <意图...>        记录一步操作
          [--target <路径>] [--action <动作>]   提供后先做委托检查
+         [--taint <类型:值>]                   记录本步数据来源（可多次）
   xl-taskd status <任务编号>               查看任务历史
   xl-taskd list                           列出所有任务
   xl-taskd done <任务编号>                 标记任务完成
@@ -68,6 +71,12 @@ fn help() {
   xl-taskd approve <委托编号>              批准委托（人类动作）
   xl-taskd delegations <任务编号>           查看委托状态
   xl-taskd undo <任务编号> [工作单元编号]    撤销到某个工作单元之前（省略=全部）
+  xl-taskd taint <任务编号>                 查看任务的数据来源
+  xl-taskd acknowledge <任务编号> [理由]     确认已看过不可信来源（写操作放行）
+
+taint 语法（--taint 用）：
+  web:<url>  mail:<地址>  api:<来源>  untrusted:<路径>  trusted:<路径>
+  device:<类型>:<id>  user  ai
 
 环境变量：
   XLTASKD_DB    数据库路径，默认 ./taskd.db
@@ -110,10 +119,11 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
     }
     let task_id = args[0].clone();
 
-    // 解析：intent 拼起来，--target / --action 单独取
+    // 解析：intent 拼起来，--target / --action / --taint 单独取
     let mut intent_parts: Vec<String> = Vec::new();
     let mut target: Option<String> = None;
     let mut action_str: Option<String> = None;
+    let mut taint_specs: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -124,6 +134,12 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
             "--action" => {
                 i += 1;
                 action_str = args.get(i).cloned();
+            }
+            "--taint" => {
+                i += 1;
+                if let Some(s) = args.get(i) {
+                    taint_specs.push(s.clone());
+                }
             }
             other => intent_parts.push(other.to_string()),
         }
@@ -149,10 +165,16 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
 
-    // ---- 委托检查 + 自动快照 ----
+    // ---- 委托检查 + 溯源检查 + 自动快照 ----
     let mut used: Option<String> = None;
     let mut effect: Option<Effect> = None;
     let mut snapshot_id: Option<String> = None;
+
+    // 本步声明的数据来源
+    let mut taint = TaintSet::default();
+    for spec in &taint_specs {
+        taint.add(parse_taint_spec(spec)?);
+    }
 
     if let (Some(t), Some(a)) = (&target, &action_str) {
         let action = parse_action(a)?;
@@ -179,6 +201,29 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
                      然后用 xl-taskd approve <委托编号> 批准。",
                     t, a, task.id, t, a
                 ));
+            }
+        }
+
+        // ---- 溯源闸门：任务接触过不可信来源时，写操作需要先确认 ----
+        if matches!(action, Action::Write | Action::Delete) {
+            let mut combined = store.task_taint(&task.id).map_err(|e| e.to_string())?;
+            combined.merge(&taint);
+            if combined.has_untrusted() {
+                let fp = combined.fingerprint();
+                let acked = store.get_taint_ack(&task.id).map_err(|e| e.to_string())?;
+                if !matches!(&acked, Some((h, _, _)) if h == &fp) {
+                    let list = combined
+                        .untrusted_descriptions()
+                        .iter()
+                        .map(|s| format!("  · {s}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    return Err(format!(
+                        "需要确认：本次写操作基于不可信来源\n{list}\n\
+                         把这些来源展示给用户；用户确认后执行：\n  xl-taskd acknowledge {}",
+                        task.id
+                    ));
+                }
             }
         }
 
@@ -220,6 +265,7 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
     if let Some(e) = effect {
         step = step.with_effect(e);
     }
+    step = step.with_taint(taint);
     step.finish(StepResult::Ok { payload: None });
     store.append_step(&step).map_err(|e| e.to_string())?;
 
@@ -245,6 +291,52 @@ fn looks_like_path(s: &str) -> bool {
     }
     let b = s.as_bytes();
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// 解析 `--taint <类型>:<值>`。
+///
+/// 支持：web: / mail: / api: / untrusted: / trusted: / device:<类型>:<id> / user / ai
+fn parse_taint_spec(s: &str) -> Result<TaintSource, String> {
+    if s == "user" {
+        return Ok(TaintSource::User);
+    }
+    if s == "ai" {
+        return Ok(TaintSource::AiGenerated);
+    }
+    let (kind, rest) = s
+        .split_once(':')
+        .ok_or_else(|| format!("taint 格式应为 <类型>:<值>，收到：{s}"))?;
+
+    match kind {
+        "web" => Ok(TaintSource::External {
+            external_kind: ExternalKind::Web,
+            origin: rest.to_string(),
+        }),
+        "mail" => Ok(TaintSource::External {
+            external_kind: ExternalKind::Mail,
+            origin: rest.to_string(),
+        }),
+        "api" => Ok(TaintSource::External {
+            external_kind: ExternalKind::Api,
+            origin: rest.to_string(),
+        }),
+        "untrusted" => Ok(TaintSource::LocalUntrusted {
+            path: rest.to_string(),
+        }),
+        "trusted" => Ok(TaintSource::LocalTrusted {
+            path: rest.to_string(),
+        }),
+        "device" => {
+            let (k, id) = rest
+                .split_once(':')
+                .ok_or("device 格式：device:<类型>:<id>")?;
+            Ok(TaintSource::ExternalDevice {
+                device_kind: k.to_string(),
+                id: id.to_string(),
+            })
+        }
+        other => Err(format!("未知 taint 类型：{other}")),
+    }
 }
 
 fn parse_action(s: &str) -> Result<Action, String> {
@@ -498,6 +590,74 @@ fn cmd_undo(args: &[String]) -> Result<(), String> {
             println!("    · {s}");
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 溯源
+
+fn cmd_taint(args: &[String]) -> Result<(), String> {
+    let task_id = args.first().ok_or("用法：xl-taskd taint <任务编号>")?;
+    let store = open_store()?;
+    let taint = store.task_taint(task_id).map_err(|e| e.to_string())?;
+
+    if taint.is_empty() {
+        println!("该任务没有记录任何数据来源。");
+        return Ok(());
+    }
+
+    println!("数据来源：");
+    for s in taint.sources() {
+        println!(
+            "  · {}（{}）",
+            s.describe(),
+            if s.is_untrusted() { "不可信" } else { "可信" }
+        );
+    }
+
+    let ack = store.get_taint_ack(task_id).map_err(|e| e.to_string())?;
+    let fp = taint.fingerprint();
+    let acked = matches!(&ack, Some((h, _, _)) if h == &fp);
+
+    println!();
+    println!("不可信来源  {} 个", taint.untrusted_descriptions().len());
+    println!(
+        "确认状态    {}",
+        if acked {
+            "已确认"
+        } else if taint.has_untrusted() {
+            "未确认（写操作会被拦截）"
+        } else {
+            "无需确认"
+        }
+    );
+    Ok(())
+}
+
+fn cmd_acknowledge(args: &[String]) -> Result<(), String> {
+    let task_id = args
+        .first()
+        .ok_or("用法：xl-taskd acknowledge <任务编号> [理由]")?;
+    let reason = if args.len() > 1 {
+        Some(args[1..].join(" "))
+    } else {
+        None
+    };
+
+    let store = open_store()?;
+    let taint = store.task_taint(task_id).map_err(|e| e.to_string())?;
+    let fp = taint.fingerprint();
+    store
+        .ack_taint(task_id, &fp, reason.as_deref())
+        .map_err(|e| e.to_string())?;
+
+    println!("已确认来源集合（指纹 {}）", &fp[..fp.len().min(48)]);
+    if taint.has_untrusted() {
+        println!("不可信来源：");
+        for d in taint.untrusted_descriptions() {
+            println!("  · {d}");
+        }
+    }
+    println!("之后再出现新的不可信来源，本确认会自动失效。");
     Ok(())
 }
 

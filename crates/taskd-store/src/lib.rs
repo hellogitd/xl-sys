@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS access_log (
     allowed     INTEGER NOT NULL,
     at          INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS taint_acks (
+    task_id         TEXT PRIMARY KEY,
+    sources_hash    TEXT NOT NULL,
+    acknowledged_at INTEGER NOT NULL,
+    reason          TEXT
+);
 "#;
 
 pub struct Store {
@@ -535,6 +542,47 @@ impl Store {
     /// 列出任务的委托（按创建顺序）。
     pub fn list_delegations_for_task(&self, task_id: &str) -> Result<Vec<Delegation>> {
         self.list_delegations(task_id)
+    }
+
+    // ------------------------------------------------------------ 溯源
+
+    /// 聚合任务的全部数据来源（所有步骤的 taint 取并集）。
+    pub fn task_taint(&self, task_id: &str) -> Result<TaintSet> {
+        let steps = self.list_steps(task_id)?;
+        let mut set = TaintSet::default();
+        for s in &steps {
+            set.merge(&s.taint);
+        }
+        Ok(set)
+    }
+
+    /// 记录一次「用户已确认不可信来源」的确认。
+    pub fn ack_taint(&self, task_id: &str, sources_hash: &str, reason: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO taint_acks (task_id, sources_hash, acknowledged_at, reason)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![task_id, sources_hash, now_ms(), reason],
+        )?;
+        Ok(())
+    }
+
+    /// 读取确认记录：(来源指纹, 确认时间, 理由)。
+    pub fn get_taint_ack(&self, task_id: &str) -> Result<Option<(String, i64, Option<String>)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT sources_hash, acknowledged_at, reason FROM taint_acks WHERE task_id = ?1",
+                params![task_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 }
 

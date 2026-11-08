@@ -127,6 +127,14 @@ impl McpServer {
                                 "type": "string",
                                 "enum": ["read", "write", "delete", "execute", "net", "device"],
                                 "description": "操作类型，与 target 一起触发委托检查"
+                            },
+                            "taint": {
+                                "type": "array",
+                                "description": "本步接触的数据来源，会并入任务累计来源",
+                                "items": {
+                                    "type": "object",
+                                    "description": "例：{\"kind\":\"external\",\"external_kind\":\"web\",\"origin\":\"https://example.com\"} 或 {\"kind\":\"local_untrusted\",\"path\":\"/下载/a.txt\"}"
+                                }
                             }
                         },
                         "required": ["task_id", "intent"]
@@ -204,6 +212,29 @@ impl McpServer {
                     }
                 },
                 {
+                    "name": "taint_report",
+                    "description": "查看任务累计的数据来源、不可信来源清单、以及是否已被确认。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": { "type": "string" }
+                        },
+                        "required": ["task_id"]
+                    }
+                },
+                {
+                    "name": "taint_acknowledge",
+                    "description": "确认「已让用户看过这些不可信来源」。确认后来源集合若变化会自动失效。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": { "type": "string" },
+                            "reason": { "type": "string", "description": "用户确认的说明（可选）" }
+                        },
+                        "required": ["task_id"]
+                    }
+                },
+                {
                     "name": "delegation_request",
                     "description": "申请权限委托。创建的是未批准的请求，必须由人类批准后才生效（agent 不能自己批准）。",
                     "inputSchema": {
@@ -261,6 +292,8 @@ impl McpServer {
             "unit_begin" => self.tool_unit_begin(&args),
             "unit_end" => self.tool_unit_end(&args),
             "task_undo" => self.tool_task_undo(&args),
+            "taint_report" => self.tool_taint_report(&args),
+            "taint_acknowledge" => self.tool_taint_acknowledge(&args),
             "delegation_request" => self.tool_delegation_request(&args),
             "delegation_list" => self.tool_delegation_list(&args),
             other => return Err((-32602, format!("未知工具：{other}"))),
@@ -294,6 +327,7 @@ impl McpServer {
     fn tool_task_step(&self, args: &Value) -> Result<Value, String> {
         let task_id = str_arg(args, "task_id")?;
         let intent = str_arg(args, "intent")?;
+        let taint = parse_taint_arg(args)?;
 
         let mut task = self
             .store
@@ -358,6 +392,11 @@ impl McpServer {
 
             // 写/删之前先留底，否则这一步不可撤销
             if matches!(action, Action::Write | Action::Delete) && looks_like_path(t) {
+                // ---- 溯源检查（S0.4）：任务接触过不可信来源时，先让人确认 ----
+                if let Err(needs_confirm) = self.taint_gate(&task.id, &taint) {
+                    return Err(needs_confirm);
+                }
+
                 let path = std::path::PathBuf::from(t);
                 match self.snapshots.capture(&path) {
                     Ok(meta) => {
@@ -412,6 +451,7 @@ impl McpServer {
         if let Some(e) = effect {
             step = step.with_effect(e);
         }
+        step = step.with_taint(taint);
         step.finish(StepResult::Ok { payload: None });
         self.store
             .append_step(&step)
@@ -424,6 +464,80 @@ impl McpServer {
             "risk": risk_label(step.risk),
             "delegation": used_delegation,
             "snapshot": snapshot_id
+        }))
+    }
+
+    // ------------------------------------------------------------ 溯源
+
+    /// 写操作前的溯源闸门：任务接触过不可信来源、且用户尚未确认时拦截。
+    fn taint_gate(&self, task_id: &str, extra: &TaintSet) -> Result<(), String> {
+        let mut combined = self
+            .store
+            .task_taint(task_id)
+            .map_err(|e| e.to_string())?;
+        combined.merge(extra);
+
+        if !combined.has_untrusted() {
+            return Ok(());
+        }
+
+        let fp = combined.fingerprint();
+        let acked = self
+            .store
+            .get_taint_ack(task_id)
+            .map_err(|e| e.to_string())?;
+        if matches!(&acked, Some((h, _, _)) if h == &fp) {
+            return Ok(());
+        }
+
+        Err(serde_json::to_string(&json!({
+            "error": "NEEDS_CONFIRMATION",
+            "task_id": task_id,
+            "untrusted_sources": combined.untrusted_descriptions(),
+            "hint": "把这些来源展示给用户并请求确认；确认后调用 taint_acknowledge 再重试本步骤"
+        }))
+        .unwrap_or_default())
+    }
+
+    fn tool_taint_report(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "task_id")?;
+        let taint = self
+            .store
+            .task_taint(&task_id)
+            .map_err(|e| e.to_string())?;
+        let acked = self
+            .store
+            .get_taint_ack(&task_id)
+            .map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "task_id": task_id,
+            "sources": taint.sources().iter().map(|s| s.describe()).collect::<Vec<_>>(),
+            "untrusted": taint.untrusted_descriptions(),
+            "has_untrusted": taint.has_untrusted(),
+            "fingerprint": taint.fingerprint(),
+            "acknowledged": matches!(&acked, Some((h, _, _)) if h == &taint.fingerprint())
+        }))
+    }
+
+    fn tool_taint_acknowledge(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "task_id")?;
+        let reason = args.get("reason").and_then(|v| v.as_str());
+
+        let taint = self
+            .store
+            .task_taint(&task_id)
+            .map_err(|e| e.to_string())?;
+        let fp = taint.fingerprint();
+        self.store
+            .ack_taint(&task_id, &fp, reason)
+            .map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "task_id": task_id,
+            "acknowledged_fingerprint": fp,
+            "untrusted_sources": taint.untrusted_descriptions(),
+            "note": "若之后出现新的不可信来源，确认会自动失效"
         }))
     }
 
@@ -679,6 +793,19 @@ fn looks_like_path(s: &str) -> bool {
     // Windows 盘符：C:\ 或 C:/
     let b = s.as_bytes();
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// 解析 `taint` 参数为 TaintSet。
+fn parse_taint_arg(args: &Value) -> Result<TaintSet, String> {
+    let mut set = TaintSet::default();
+    if let Some(arr) = args.get("taint").and_then(|v| v.as_array()) {
+        for item in arr {
+            let src: TaintSource = serde_json::from_value(item.clone())
+                .map_err(|e| format!("taint 项格式错误：{e}"))?;
+            set.add(src);
+        }
+    }
+    Ok(set)
 }
 
 fn success_response(id: Value, result: Value) -> String {
@@ -958,6 +1085,135 @@ mod tests {
             .audit_count(&task_id, false)
             .expect("query access log");
         assert_eq!(denied, 1, "拒绝应被记入审计");
+    }
+
+    // ---------------------------------------------------------- S0.4 溯源
+
+    fn grant_delegation(s: &mut McpServer, task_id: &str, scope: &str, actions: &[&str]) {
+        let actions_json = actions
+            .iter()
+            .map(|a| format!("\"{a}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{{"name":"delegation_request","arguments":{{"task_id":"{task_id}","scope":["{scope}"],"actions":[{actions_json}]}}}}}}"#
+        );
+        let v = call(s, &req);
+        let parsed: Value = serde_json::from_str(&tool_text(&v)).unwrap();
+        let id = parsed["delegation_id"].as_str().unwrap().to_string();
+        s.store.grant_delegation(&id).unwrap();
+    }
+
+    #[test]
+    fn untrusted_source_blocks_write_until_acknowledged() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "整理外部文档");
+
+        // 记录一个外部来源（只记录，不写）
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{{"name":"task_step","arguments":{{"task_id":"{task_id}","intent":"读取网页内容","taint":[{{"kind":"external","external_kind":"web","origin":"https://evil.example"}}]}}}}}}"#
+        );
+        let v = call(&mut s, &req);
+        assert_eq!(v["result"]["isError"], false);
+
+        grant_delegation(&mut s, &task_id, "/tmp", &["write"]);
+
+        // 写操作 → 被溯源闸门拦住
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "写入文件", "/tmp/x.txt", "write"),
+        );
+        assert_eq!(v["result"]["isError"], true);
+        let text = tool_text(&v);
+        assert!(text.contains("NEEDS_CONFIRMATION"), "got: {text}");
+        assert!(text.contains("evil.example"), "应列出不可信来源，got: {text}");
+
+        // 确认
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{{"name":"taint_acknowledge","arguments":{{"task_id":"{task_id}","reason":"用户已阅读来源"}}}}}}"#
+        );
+        let v = call(&mut s, &req);
+        assert_eq!(v["result"]["isError"], false);
+
+        // 重试 → 通过
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "写入文件", "/tmp/x.txt", "write"),
+        );
+        assert_eq!(v["result"]["isError"], false);
+    }
+
+    #[test]
+    fn ack_invalidated_by_new_untrusted_source() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "多来源任务");
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{{"name":"task_step","arguments":{{"task_id":"{task_id}","intent":"读网页","taint":[{{"kind":"external","external_kind":"web","origin":"https://a.example"}}]}}}}}}"#
+        );
+        call(&mut s, &req);
+        grant_delegation(&mut s, &task_id, "/tmp", &["write"]);
+
+        // 确认当前来源集合
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{{"name":"taint_acknowledge","arguments":{{"task_id":"{task_id}"}}}}}}"#
+        );
+        call(&mut s, &req);
+
+        // 第一次写通过
+        let v = call(&mut s, &step_req(&task_id, "写1", "/tmp/a.txt", "write"));
+        assert_eq!(v["result"]["isError"], false);
+
+        // 出现新的不可信来源
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{{"name":"task_step","arguments":{{"task_id":"{task_id}","intent":"又读了一个网页","taint":[{{"kind":"external","external_kind":"web","origin":"https://b.example"}}]}}}}}}"#
+        );
+        let v = call(&mut s, &req);
+        assert_eq!(v["result"]["isError"], false);
+
+        // 之前的确认应失效 → 写被拦
+        let v = call(&mut s, &step_req(&task_id, "写2", "/tmp/b.txt", "write"));
+        assert_eq!(v["result"]["isError"], true);
+        assert!(tool_text(&v).contains("NEEDS_CONFIRMATION"));
+    }
+
+    #[test]
+    fn taint_report_lists_sources() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "来源报告");
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{{"name":"task_step","arguments":{{"task_id":"{task_id}","intent":"读本地文件","taint":[{{"kind":"local_untrusted","path":"/home/u/下载/a.txt"}}]}}}}}}"#
+        );
+        call(&mut s, &req);
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":27,"method":"tools/call","params":{{"name":"taint_report","arguments":{{"task_id":"{task_id}"}}}}}}"#
+        );
+        let v = call(&mut s, &req);
+        let parsed: Value = serde_json::from_str(&tool_text(&v)).unwrap();
+        assert_eq!(parsed["has_untrusted"], true);
+        assert_eq!(parsed["acknowledged"], false);
+        assert!(parsed["untrusted"][0]
+            .as_str()
+            .unwrap()
+            .contains("下载"));
+    }
+
+    #[test]
+    fn trusted_sources_do_not_block_writes() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "只读可信文件");
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":28,"method":"tools/call","params":{{"name":"task_step","arguments":{{"task_id":"{task_id}","intent":"读自己的配置","taint":[{{"kind":"local_trusted","path":"/home/u/.config/a"}}]}}}}}}"#
+        );
+        call(&mut s, &req);
+        grant_delegation(&mut s, &task_id, "/tmp", &["write"]);
+
+        // 可信来源不应触发确认
+        let v = call(&mut s, &step_req(&task_id, "写", "/tmp/c.txt", "write"));
+        assert_eq!(v["result"]["isError"], false);
     }
 
     #[test]
