@@ -1,0 +1,35 @@
+# ---- Rust ----
+/target/
+**/*.rs.bk
+*.pdb
+# Cargo.lock 要提交：本项目最终是二进制应用，需要可复现构建
+
+# ---- Python（tools 下的脚本）----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 运行时产物 ----
+*.log
+/tmp/
+/out/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# ---- 设计资产例外说明 ----
+# 根目录的 *.png 是设计稿（蓝图、UI 概念图），要提交
