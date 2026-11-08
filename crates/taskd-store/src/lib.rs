@@ -72,7 +72,8 @@ CREATE TABLE IF NOT EXISTS delegations (
     trust_level TEXT NOT NULL,
     expires_at  INTEGER,
     max_ops     INTEGER,
-    ops_used    INTEGER NOT NULL DEFAULT 0
+    ops_used    INTEGER NOT NULL DEFAULT 0,
+    granted     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_deleg_task ON delegations(task_id);
 
@@ -351,8 +352,8 @@ impl Store {
     pub fn save_delegation(&self, d: &Delegation) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO delegations
-             (id, task_id, parent, granted_by, scope_json, actions_json, trust_level, expires_at, max_ops, ops_used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, task_id, parent, granted_by, scope_json, actions_json, trust_level, expires_at, max_ops, ops_used, granted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 d.id,
                 d.task_id,
@@ -363,7 +364,8 @@ impl Store {
                 serde_json::to_string(&d.trust_level)?,
                 d.expires_at,
                 d.max_ops,
-                d.ops_used
+                d.ops_used,
+                d.granted as i32
             ],
         )?;
         Ok(())
@@ -373,7 +375,7 @@ impl Store {
         let row = self
             .conn
             .query_row(
-                "SELECT id, task_id, parent, granted_by, scope_json, actions_json, trust_level, expires_at, max_ops, ops_used
+                "SELECT id, task_id, parent, granted_by, scope_json, actions_json, trust_level, expires_at, max_ops, ops_used, granted
                  FROM delegations WHERE id = ?1",
                 params![id],
                 |r| {
@@ -388,13 +390,14 @@ impl Store {
                         r.get::<_, Option<i64>>(7)?,
                         r.get::<_, Option<u64>>(8)?,
                         r.get::<_, u64>(9)?,
+                        r.get::<_, i32>(10)?,
                     ))
                 },
             )
             .optional()?;
 
         row.map(
-            |(id, task_id, parent, gb, scope, actions, trust, exp, max_ops, used)| {
+            |(id, task_id, parent, gb, scope, actions, trust, exp, max_ops, used, granted)| {
                 Ok(Delegation {
                     id,
                     task_id,
@@ -406,10 +409,49 @@ impl Store {
                     expires_at: exp,
                     max_ops,
                     ops_used: used,
+                    granted: granted != 0,
                 })
             },
         )
         .transpose()
+    }
+
+    pub fn list_delegations(&self, task_id: &str) -> Result<Vec<Delegation>> {
+        let ids: Vec<String> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id FROM delegations WHERE task_id = ?1 ORDER BY rowid ASC")?;
+            let rows = stmt.query_map(params![task_id], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(d) = self.get_delegation(&id)? {
+                out.push(d);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 批准一个委托（人类动作，不经 MCP 暴露给 agent）。
+    pub fn grant_delegation(&self, id: &str) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE delegations SET granted = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("delegation {id}")));
+        }
+        Ok(())
+    }
+
+    /// 记录一次使用（ops_used += 1）。
+    pub fn touch_delegation(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE delegations SET ops_used = ops_used + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 
     pub fn log_access(
@@ -433,6 +475,21 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// 统计审计记录条数（测试与 UI 用）。
+    pub fn audit_count(&self, task_id: &str, allowed: bool) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM access_log WHERE task_id = ?1 AND allowed = ?2",
+            params![task_id, allowed as i32],
+            |r| r.get(0),
+        )?;
+        Ok(n)
+    }
+
+    /// 列出任务的委托（按创建顺序）。
+    pub fn list_delegations_for_task(&self, task_id: &str) -> Result<Vec<Delegation>> {
+        self.list_delegations(task_id)
     }
 }
 

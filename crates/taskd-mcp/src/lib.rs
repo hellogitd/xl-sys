@@ -108,7 +108,7 @@ impl McpServer {
                 },
                 {
                     "name": "task_step",
-                    "description": "为任务记录一步操作。intent 必填，保证系统永远能回答「这一步想干什么」。",
+                    "description": "为任务记录一步操作。intent 必填。若提供 target + action，会先做委托检查：未授权则返回 NEEDS_PERMISSION 并暂停任务。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -119,7 +119,13 @@ impl McpServer {
                                 "enum": ["tool_call", "decision", "user_input", "sub_task", "external"],
                                 "description": "步骤类型，默认 tool_call"
                             },
-                            "unit_id": { "type": "string", "description": "所属工作单元（可选）" }
+                            "unit_id": { "type": "string", "description": "所属工作单元（可选）" },
+                            "target": { "type": "string", "description": "操作对象（路径/URL/设备ID）。提供后触发委托检查" },
+                            "action": {
+                                "type": "string",
+                                "enum": ["read", "write", "delete", "execute", "net", "device"],
+                                "description": "操作类型，与 target 一起触发委托检查"
+                            }
                         },
                         "required": ["task_id", "intent"]
                     }
@@ -182,6 +188,42 @@ impl McpServer {
                         },
                         "required": ["unit_id"]
                     }
+                },
+                {
+                    "name": "delegation_request",
+                    "description": "申请权限委托。创建的是未批准的请求，必须由人类批准后才生效（agent 不能自己批准）。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": { "type": "string" },
+                            "scope": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "资源范围：路径 / URL 域名 / 设备ID 的 glob"
+                            },
+                            "actions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": ["read", "write", "delete", "execute", "net", "device"]
+                                }
+                            },
+                            "ttl_secs": { "type": "integer", "description": "有效期（秒），默认 600" },
+                            "max_ops": { "type": "integer", "description": "最大操作次数（可选）" }
+                        },
+                        "required": ["task_id", "scope", "actions"]
+                    }
+                },
+                {
+                    "name": "delegation_list",
+                    "description": "查看任务的全部委托及其批准/生效状态。",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "task_id": { "type": "string" }
+                        },
+                        "required": ["task_id"]
+                    }
                 }
             ]
         })
@@ -204,6 +246,8 @@ impl McpServer {
             "task_done" => self.tool_task_done(&args),
             "unit_begin" => self.tool_unit_begin(&args),
             "unit_end" => self.tool_unit_end(&args),
+            "delegation_request" => self.tool_delegation_request(&args),
+            "delegation_list" => self.tool_delegation_list(&args),
             other => return Err((-32602, format!("未知工具：{other}"))),
         };
 
@@ -242,7 +286,68 @@ impl McpServer {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("任务不存在：{task_id}"))?;
 
+        // 任何一步操作都意味着任务已开始，先把 Pending 变成 Running，
+        // 这样后续的「越界暂停」才有合法状态转换可用。
         if task.state == TaskState::Pending {
+            task.transition_to(TaskState::Running)
+                .map_err(|e| e.to_string())?;
+            self.store
+                .update_task_state(&task.id, TaskState::Running)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // ---- 委托检查（S0.2）：带 target + action 的步骤必须先获得授权 ----
+        let mut used_delegation: Option<String> = None;
+        if let (Some(target), Some(action_str)) = (
+            args.get("target").and_then(|v| v.as_str()),
+            args.get("action").and_then(|v| v.as_str()),
+        ) {
+            let action = parse_action(action_str)?;
+            let delegations = self
+                .store
+                .list_delegations(&task.id)
+                .map_err(|e| e.to_string())?;
+
+            match check_delegations(&delegations, target, action, now_ms()) {
+                CheckOutcome::Allowed { delegation } => {
+                    self.store
+                        .log_access(&task.id, Some(&delegation), target, action, true)
+                        .map_err(|e| e.to_string())?;
+                    self.store
+                        .touch_delegation(&delegation)
+                        .map_err(|e| e.to_string())?;
+                    used_delegation = Some(delegation);
+                }
+                CheckOutcome::NeedsPermission => {
+                    self.store
+                        .log_access(&task.id, None, target, action, false)
+                        .map_err(|e| e.to_string())?;
+                    // P-4：越界 = 暂停 + 请求，不是拒绝 + 继续
+                    if task.state == TaskState::Running {
+                        let _ = task.transition_to(TaskState::Paused);
+                        let _ = self.store.update_task_state(&task.id, TaskState::Paused);
+                    }
+                    return Err(serde_json::to_string(&json!({
+                        "error": "NEEDS_PERMISSION",
+                        "task_id": task.id,
+                        "target": target,
+                        "action": action_str,
+                        "task_state": "paused",
+                        "hint": "调用 delegation_request 申请委托，等人类批准后重试本步骤"
+                    }))
+                    .unwrap_or_default());
+                }
+            }
+        }
+
+        // 暂停中的任务在通过检查后恢复运行
+        if task.state == TaskState::Paused {
+            task.transition_to(TaskState::Running)
+                .map_err(|e| e.to_string())?;
+            self.store
+                .update_task_state(&task.id, TaskState::Running)
+                .map_err(|e| e.to_string())?;
+        } else if task.state == TaskState::Pending {
             task.transition_to(TaskState::Running)
                 .map_err(|e| e.to_string())?;
             self.store
@@ -276,8 +381,79 @@ impl McpServer {
             "task_id": task.id,
             "index": idx,
             "intent": step.intent,
-            "risk": risk_label(step.risk)
+            "risk": risk_label(step.risk),
+            "delegation": used_delegation
         }))
+    }
+
+    // ------------------------------------------------------------ 委托
+
+    fn tool_delegation_request(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "task_id")?;
+        let scope = str_array_arg(args, "scope")?;
+        let actions_raw = str_array_arg(args, "actions")?;
+        let actions: Vec<Action> = actions_raw
+            .iter()
+            .map(|a| parse_action(a))
+            .collect::<Result<_, _>>()?;
+
+        let ttl_secs = args
+            .get("ttl_secs")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(600);
+        let max_ops = args.get("max_ops").and_then(|v| v.as_u64());
+
+        // 确认任务存在
+        self.store
+            .get_task(&task_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("任务不存在：{task_id}"))?;
+
+        let mut d = Delegation::new(
+            task_id.clone(),
+            Principal::User,
+            scope.clone(),
+            actions.clone(),
+            TrustLevel::L1Restricted,
+        );
+        d.expires_at = Some(now_ms() + ttl_secs * 1000);
+        d.max_ops = max_ops;
+        // granted 保持 false：批准是人的动作，agent 不能自己批准
+        self.store.save_delegation(&d).map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "delegation_id": d.id,
+            "task_id": task_id,
+            "scope": scope,
+            "actions": actions,
+            "status": "pending_approval",
+            "message": format!("等待人类批准：xl-taskd approve {}", d.id)
+        }))
+    }
+
+    fn tool_delegation_list(&self, args: &Value) -> Result<Value, String> {
+        let task_id = str_arg(args, "task_id")?;
+        let delegations = self
+            .store
+            .list_delegations(&task_id)
+            .map_err(|e| e.to_string())?;
+        let now = now_ms();
+        let items: Vec<Value> = delegations
+            .iter()
+            .map(|d| {
+                json!({
+                    "delegation_id": d.id,
+                    "scope": d.scope,
+                    "actions": d.actions,
+                    "granted": d.granted,
+                    "active": d.is_active(now),
+                    "expires_at": d.expires_at,
+                    "ops_used": d.ops_used,
+                    "max_ops": d.max_ops
+                })
+            })
+            .collect();
+        Ok(json!({ "delegations": items }))
     }
 
     fn tool_task_status(&self, args: &Value) -> Result<Value, String> {
@@ -397,6 +573,32 @@ fn str_arg(args: &Value, key: &str) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("缺少参数：{key}"))
+}
+
+fn str_array_arg(args: &Value, key: &str) -> Result<Vec<String>, String> {
+    let arr = args
+        .get(key)
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("缺少参数：{key}（应为字符串数组）"))?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("参数 {key} 里含非字符串元素"))
+        })
+        .collect()
+}
+
+fn parse_action(s: &str) -> Result<Action, String> {
+    match s {
+        "read" => Ok(Action::Read),
+        "write" => Ok(Action::Write),
+        "delete" => Ok(Action::Delete),
+        "execute" => Ok(Action::Execute),
+        "net" => Ok(Action::Net),
+        "device" => Ok(Action::Device),
+        other => Err(format!("未知动作：{other}")),
+    }
 }
 
 fn success_response(id: Value, result: Value) -> String {
@@ -539,6 +741,137 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["state"], "running");
         assert_eq!(parsed["steps"].as_array().unwrap().len(), 3);
+    }
+
+    // ---------------------------------------------------------- S0.2 委托
+
+    fn begin_task(s: &mut McpServer, goal: &str) -> String {
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{{"name":"task_begin","arguments":{{"goal":"{goal}"}}}}}}"#
+        );
+        let v = call(s, &req);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        parsed["task_id"].as_str().unwrap().to_string()
+    }
+
+    fn tool_text(v: &Value) -> String {
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn step_req(task_id: &str, intent: &str, target: &str, action: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{{"name":"task_step","arguments":{{"task_id":"{task_id}","intent":"{intent}","target":"{target}","action":"{action}"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn step_without_delegation_needs_permission_and_pauses() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "整理下载目录");
+
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "移动文件", "/home/u/下载/a.png", "write"),
+        );
+        assert_eq!(v["result"]["isError"], true);
+        let text = tool_text(&v);
+        assert!(text.contains("NEEDS_PERMISSION"), "got: {text}");
+
+        // P-4：越界后任务应被暂停
+        let t = s.store.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Paused);
+    }
+
+    #[test]
+    fn delegation_requires_human_approval() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "整理下载目录");
+
+        // agent 申请委托
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{{"name":"delegation_request","arguments":{{"task_id":"{task_id}","scope":["/home/u/下载"],"actions":["read","write"],"ttl_secs":600}}}}}}"#
+        );
+        let v = call(&mut s, &req);
+        let text = tool_text(&v);
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        let deleg_id = parsed["delegation_id"].as_str().unwrap().to_string();
+        assert_eq!(parsed["status"], "pending_approval");
+
+        // 未批准 → 仍然拒绝
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "移动文件", "/home/u/下载/a.png", "write"),
+        );
+        assert_eq!(v["result"]["isError"], true);
+
+        // 人类批准（直接操作 store，等价于 CLI approve）
+        s.store.grant_delegation(&deleg_id).unwrap();
+
+        // 重试 → 通过，且任务恢复运行
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "移动文件", "/home/u/下载/a.png", "write"),
+        );
+        assert_eq!(v["result"]["isError"], false);
+        let t = s.store.get_task(&task_id).unwrap().unwrap();
+        assert_eq!(t.state, TaskState::Running);
+    }
+
+    #[test]
+    fn out_of_scope_still_denied_after_grant() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "整理下载目录");
+
+        let req = format!(
+            r#"{{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{{"name":"delegation_request","arguments":{{"task_id":"{task_id}","scope":["/home/u/下载"],"actions":["read"]}}}}}}"#
+        );
+        let v = call(&mut s, &req);
+        let parsed: Value = serde_json::from_str(&tool_text(&v)).unwrap();
+        let deleg_id = parsed["delegation_id"].as_str().unwrap().to_string();
+        s.store.grant_delegation(&deleg_id).unwrap();
+
+        // 范围外
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "读密码", "/home/u/密码.txt", "read"),
+        );
+        assert_eq!(v["result"]["isError"], true);
+
+        // 动作外（read 委托做不了 write）
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "写文件", "/home/u/下载/a.png", "write"),
+        );
+        assert_eq!(v["result"]["isError"], true);
+
+        // 范围内 read 通过
+        let v = call(
+            &mut s,
+            &step_req(&task_id, "读文件", "/home/u/下载/a.png", "read"),
+        );
+        assert_eq!(v["result"]["isError"], false);
+    }
+
+    #[test]
+    fn access_log_records_both_outcomes() {
+        let mut s = server();
+        let task_id = begin_task(&mut s, "整理下载目录");
+
+        // 一次拒绝
+        let _ = call(
+            &mut s,
+            &step_req(&task_id, "移动文件", "/home/u/下载/a.png", "write"),
+        );
+
+        let denied: i64 = s
+            .store
+            .audit_count(&task_id, false)
+            .expect("query access log");
+        assert_eq!(denied, 1, "拒绝应被记入审计");
     }
 
     #[test]

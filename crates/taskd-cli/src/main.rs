@@ -30,6 +30,9 @@ fn main() -> ExitCode {
         "done" => cmd_done(&args[1..]),
         "unit-begin" => cmd_unit_begin(&args[1..]),
         "unit-end" => cmd_unit_end(&args[1..]),
+        "request" => cmd_request(&args[1..]),
+        "approve" => cmd_approve(&args[1..]),
+        "delegations" => cmd_delegations(&args[1..]),
         "help" | "--help" | "-h" => {
             help();
             Ok(())
@@ -53,19 +56,24 @@ fn help() {
 用法：
   xl-taskd begin <目标>                    创建一个任务
   xl-taskd step <任务编号> <意图...>        记录一步操作
+         [--target <路径>] [--action <动作>]   提供后先做委托检查
   xl-taskd status <任务编号>               查看任务历史
   xl-taskd list                           列出所有任务
   xl-taskd done <任务编号>                 标记任务完成
   xl-taskd unit-begin <任务编号> [类型]     开始一个工作单元（attempt/change/release）
   xl-taskd unit-end <单元编号> [结果]       结束工作单元（succeeded/failed/abandoned）
+  xl-taskd request <任务编号> <范围> <动作...>  申请委托（需人类批准）
+  xl-taskd approve <委托编号>              批准委托（人类动作）
+  xl-taskd delegations <任务编号>           查看委托状态
 
 环境变量：
   XLTASKD_DB    数据库路径，默认 ./taskd.db
 
 示例：
   xl-taskd begin 整理下载文件夹里的截图
-  xl-taskd step task_01J... 列出下载目录中的 png 文件
-  xl-taskd status task_01J..."#
+  xl-taskd step task_01J... "移动文件" --target /home/u/下载/a.png --action write
+  xl-taskd request task_01J... /home/u/下载 read write
+  xl-taskd approve deleg_01J..."#
     );
 }
 
@@ -95,19 +103,82 @@ fn cmd_begin(args: &[String]) -> Result<(), String> {
 
 fn cmd_step(args: &[String]) -> Result<(), String> {
     if args.len() < 2 {
-        return Err("用法：xl-taskd step <任务编号> <意图...>".into());
+        return Err("用法：xl-taskd step <任务编号> <意图...> [--target <路径>] [--action <动作>]".into());
     }
-    let task_id = &args[0];
-    let intent = args[1..].join(" ");
+    let task_id = args[0].clone();
+
+    // 解析：intent 拼起来，--target / --action 单独取
+    let mut intent_parts: Vec<String> = Vec::new();
+    let mut target: Option<String> = None;
+    let mut action_str: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" => {
+                i += 1;
+                target = args.get(i).cloned();
+            }
+            "--action" => {
+                i += 1;
+                action_str = args.get(i).cloned();
+            }
+            other => intent_parts.push(other.to_string()),
+        }
+        i += 1;
+    }
+    let intent = intent_parts.join(" ");
+    if intent.is_empty() {
+        return Err("缺少意图（intent 必填，保证系统能回答「为什么」）".into());
+    }
 
     let store = open_store()?;
     let mut task = store
-        .get_task(task_id)
+        .get_task(&task_id)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("任务不存在：{task_id}"))?;
 
-    // 首次记录步骤时自动进入运行中
+    // 进入运行态，这样越界暂停有合法转换
     if task.state == TaskState::Pending {
+        task.transition_to(TaskState::Running)
+            .map_err(|e| e.to_string())?;
+        store
+            .update_task_state(&task.id, TaskState::Running)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // ---- 委托检查 ----
+    let mut used: Option<String> = None;
+    if let (Some(t), Some(a)) = (&target, &action_str) {
+        let action = parse_action(a)?;
+        let delegations = store.list_delegations(&task.id).map_err(|e| e.to_string())?;
+        match check_delegations(&delegations, t, action, now_ms()) {
+            CheckOutcome::Allowed { delegation } => {
+                store
+                    .log_access(&task.id, Some(&delegation), t, action, true)
+                    .map_err(|e| e.to_string())?;
+                store.touch_delegation(&delegation).map_err(|e| e.to_string())?;
+                used = Some(delegation);
+            }
+            CheckOutcome::NeedsPermission => {
+                store
+                    .log_access(&task.id, None, t, action, false)
+                    .map_err(|e| e.to_string())?;
+                if task.state == TaskState::Running {
+                    let _ = task.transition_to(TaskState::Paused);
+                    let _ = store.update_task_state(&task.id, TaskState::Paused);
+                }
+                return Err(format!(
+                    "需要授权：{} 上的 {} 操作未被任何有效委托覆盖\n\
+                     任务已暂停。申请方式：\n  xl-taskd request {} {} {}\n\
+                     然后用 xl-taskd approve <委托编号> 批准。",
+                    t, a, task.id, t, a
+                ));
+            }
+        }
+    }
+
+    // 暂停中的任务在通过检查后恢复
+    if task.state == TaskState::Paused {
         task.transition_to(TaskState::Running)
             .map_err(|e| e.to_string())?;
         store
@@ -123,7 +194,22 @@ fn cmd_step(args: &[String]) -> Result<(), String> {
     println!("已记录第 {idx} 步");
     println!("  意图  {}", step.intent);
     println!("  风险  {}（{}）", risk_label(step.risk), risk_desc(step.risk));
+    if let Some(d) = used {
+        println!("  授权  {}（已计入审计）", d);
+    }
     Ok(())
+}
+
+fn parse_action(s: &str) -> Result<Action, String> {
+    match s {
+        "read" => Ok(Action::Read),
+        "write" => Ok(Action::Write),
+        "delete" => Ok(Action::Delete),
+        "execute" => Ok(Action::Execute),
+        "net" => Ok(Action::Net),
+        "device" => Ok(Action::Device),
+        other => Err(format!("未知动作：{other}（可用 read/write/delete/execute/net/device）")),
+    }
 }
 
 // ---------------------------------------------------------------- status
@@ -253,6 +339,84 @@ fn cmd_unit_end(args: &[String]) -> Result<(), String> {
         .finish_unit(unit_id, outcome)
         .map_err(|e| e.to_string())?;
     println!("工作单元已结束：{} → {}", short(unit_id), outcome_label(outcome));
+    Ok(())
+}
+
+// ---------------------------------------------------------------- 委托
+
+fn cmd_request(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err("用法：xl-taskd request <任务编号> <范围> <动作...>".into());
+    }
+    let task_id = &args[0];
+    let scope = vec![args[1].clone()];
+    let actions: Vec<Action> = args[2..]
+        .iter()
+        .map(|a| parse_action(a))
+        .collect::<Result<_, _>>()?;
+
+    let store = open_store()?;
+    store
+        .get_task(task_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("任务不存在：{task_id}"))?;
+
+    let mut d = Delegation::new(
+        task_id.clone(),
+        Principal::User,
+        scope,
+        actions,
+        TrustLevel::L1Restricted,
+    );
+    d.expires_at = Some(now_ms() + 600_000); // 默认 10 分钟
+    store.save_delegation(&d).map_err(|e| e.to_string())?;
+
+    println!("委托申请已创建（待批准）");
+    println!("  编号  {}", d.id);
+    println!("  范围  {:?}", d.scope);
+    println!("  动作  {:?}", d.actions);
+    println!("  批准  xl-taskd approve {}", d.id);
+    Ok(())
+}
+
+fn cmd_approve(args: &[String]) -> Result<(), String> {
+    let id = args.first().ok_or("用法：xl-taskd approve <委托编号>")?;
+    let store = open_store()?;
+    store.grant_delegation(id).map_err(|e| e.to_string())?;
+    println!("委托已批准：{id}");
+    println!("agent 可以重试之前被拒绝的步骤了。");
+    Ok(())
+}
+
+fn cmd_delegations(args: &[String]) -> Result<(), String> {
+    let task_id = args
+        .first()
+        .ok_or("用法：xl-taskd delegations <任务编号>")?;
+    let store = open_store()?;
+    let ds = store.list_delegations(task_id).map_err(|e| e.to_string())?;
+    if ds.is_empty() {
+        println!("该任务没有委托。");
+        return Ok(());
+    }
+    let now = now_ms();
+    println!("{:<32} {:<8} {:<8} {:<10} 范围 / 动作", "编号", "批准", "生效", "已用次数");
+    for d in &ds {
+        let granted = if d.granted { "是" } else { "否" };
+        let active = if d.is_active(now) { "是" } else { "否" };
+        println!(
+            "{:<32} {:<8} {:<8} {:<10} {:?} {:?}",
+            d.id,
+            granted,
+            active,
+            format!(
+                "{}/{}",
+                d.ops_used,
+                d.max_ops.map(|m| m.to_string()).unwrap_or_else(|| "∞".into())
+            ),
+            d.scope,
+            d.actions
+        );
+    }
     Ok(())
 }
 

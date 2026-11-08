@@ -451,6 +451,8 @@ pub struct Delegation {
     pub expires_at: Option<i64>,
     pub max_ops: Option<u64>,
     pub ops_used: u64,
+    /// 是否已被人类批准。agent 只能创建请求（false），批准是人的动作。
+    pub granted: bool,
 }
 
 /// 简单匹配：`*` = 全部，`前缀*` = 前缀匹配，目录 = 覆盖其下所有路径，否则精确匹配。
@@ -493,6 +495,7 @@ impl Delegation {
             expires_at: None,
             max_ops: None,
             ops_used: 0,
+            granted: false,
         }
     }
 
@@ -502,6 +505,11 @@ impl Delegation {
 
     pub fn is_exhausted(&self) -> bool {
         matches!(self.max_ops, Some(max) if self.ops_used >= max)
+    }
+
+    /// 此刻是否可用：已批准 + 未过期 + 未耗尽。
+    pub fn is_active(&self, now: i64) -> bool {
+        self.granted && !self.is_expired(now) && !self.is_exhausted()
     }
 
     /// 本次操作是否被本委托覆盖。
@@ -542,6 +550,36 @@ fn pattern_covers(parent: &str, child: &str) -> bool {
         // 父是目录、子在目录之下
         (None, None) => is_under(child, parent),
     }
+}
+
+// ---------------------------------------------------------------- 授权检查
+
+/// 授权检查结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckOutcome {
+    /// 被某个有效委托覆盖
+    Allowed { delegation: DelegationId },
+    /// 没有有效委托覆盖该操作
+    NeedsPermission,
+}
+
+/// 在一组委托中查找能覆盖本次操作的委托。
+///
+/// 只有「已批准 + 未过期 + 未耗尽」的委托才算数（不变量 P-2、P-3）。
+pub fn check_delegations(
+    delegations: &[Delegation],
+    target: &str,
+    action: Action,
+    now: i64,
+) -> CheckOutcome {
+    delegations
+        .iter()
+        .filter(|d| d.is_active(now))
+        .find(|d| d.covers(target, action))
+        .map(|d| CheckOutcome::Allowed {
+            delegation: d.id.clone(),
+        })
+        .unwrap_or(CheckOutcome::NeedsPermission)
 }
 
 // ---------------------------------------------------------------- 测试
@@ -726,6 +764,88 @@ mod tests {
             TrustLevel::L3Full,
         );
         assert!(!bad_trust.is_subset_of(&parent));
+    }
+
+    #[test]
+    fn ungranted_delegation_never_allows() {
+        let now = now_ms();
+        let d = Delegation::new(
+            "t",
+            Principal::User,
+            vec!["/home/u/下载".into()],
+            vec![Action::Read],
+            TrustLevel::L1Restricted,
+        );
+        assert_eq!(
+            check_delegations(&[d], "/home/u/下载/a.png", Action::Read, now),
+            CheckOutcome::NeedsPermission
+        );
+    }
+
+    #[test]
+    fn granted_delegation_allows_operation() {
+        let now = now_ms();
+        let mut d = Delegation::new(
+            "t",
+            Principal::User,
+            vec!["/home/u/下载".into()],
+            vec![Action::Read],
+            TrustLevel::L1Restricted,
+        );
+        d.granted = true;
+        match check_delegations(&[d], "/home/u/下载/a.png", Action::Read, now) {
+            CheckOutcome::Allowed { delegation } => assert!(delegation.starts_with("deleg_")),
+            other => panic!("expected allowed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expired_or_exhausted_delegation_is_inactive() {
+        let now = now_ms();
+        let mut d = Delegation::new(
+            "t",
+            Principal::User,
+            vec!["*".into()],
+            vec![Action::Read],
+            TrustLevel::L1Restricted,
+        );
+        d.granted = true;
+        d.expires_at = Some(now - 1);
+        assert_eq!(
+            check_delegations(std::slice::from_ref(&d), "/x", Action::Read, now),
+            CheckOutcome::NeedsPermission
+        );
+
+        d.expires_at = None;
+        d.max_ops = Some(1);
+        d.ops_used = 1;
+        assert_eq!(
+            check_delegations(&[d], "/x", Action::Read, now),
+            CheckOutcome::NeedsPermission
+        );
+    }
+
+    #[test]
+    fn action_outside_scope_needs_permission() {
+        let now = now_ms();
+        let mut d = Delegation::new(
+            "t",
+            Principal::User,
+            vec!["/home/u/下载".into()],
+            vec![Action::Read],
+            TrustLevel::L1Restricted,
+        );
+        d.granted = true;
+        // 动作不在委托里
+        assert_eq!(
+            check_delegations(std::slice::from_ref(&d), "/home/u/下载/a.png", Action::Delete, now),
+            CheckOutcome::NeedsPermission
+        );
+        // 路径不在委托里
+        assert_eq!(
+            check_delegations(&[d], "/home/u/密码.txt", Action::Read, now),
+            CheckOutcome::NeedsPermission
+        );
     }
 
     #[test]
